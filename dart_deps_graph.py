@@ -29,6 +29,7 @@ Usage
     python dart_class_resolver.py path/to/target.dart --output class-tree
     python dart_class_resolver.py path/to/target.dart --verbose
     python dart_class_resolver.py path/to/target.dart --level 2
+    python dart_class_resolver.py path/to/target.dart --external-level 1
     python dart_class_resolver.py path/to/target.dart --entry-types MyWidget,AppState
 """
 from __future__ import annotations
@@ -488,6 +489,17 @@ class DependencyGraph:
     unresolved: dict[Path, set[str]] = field(
         default_factory=lambda: defaultdict(set)
     )
+def _is_external_file(file: Path, external_lib_dirs: dict[str, Path]) -> bool:
+    """Return True if *file* lives inside any external package lib directory."""
+    for lib_dir in external_lib_dirs.values():
+        try:
+            file.relative_to(lib_dir)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def build_dependency_graph(
     entry: Path,
     lib_dir: Path,
@@ -496,14 +508,19 @@ def build_dependency_graph(
     max_depth: int | None = None,
     entry_types: list[str] | None = None,
     external_lib_dirs: dict[str, Path] | None = None,
+    external_max_depth: int | None = None,
 ) -> DependencyGraph:
     """
     Build a class-level dependency graph starting from *entry*.
     Parameters
     ----------
-    entry_types : if given, only trace dependencies of these type names
-                  (must be declared in the entry file).
-    max_depth   : maximum edge depth (None = unlimited).
+    entry_types        : if given, only trace dependencies of these type names
+                         (must be declared in the entry file).
+    max_depth          : maximum overall edge depth (None = unlimited).
+    external_max_depth : maximum traversal depth *within* external packages.
+                         0 = skip external packages entirely;
+                         N = follow N levels of external-package deps;
+                         None = unlimited.
     """
     # Step 1 – build the global type index (scan all reachable files once)
     if verbose:
@@ -520,12 +537,14 @@ def build_dependency_graph(
         )
         print("[phase 2] Resolving class-level dependencies …", file=sys.stderr)
     graph = DependencyGraph()
+    ext_dirs = external_lib_dirs or {}
     # BFS over the file graph, but only follow edges we discover
-    # queue items: (file, depth)
-    queue: list[tuple[Path, int]] = [(entry.resolve(), 0)]
+    # queue items: (file, overall_depth, ext_depth)
+    # ext_depth counts hops taken inside external-package territory
+    queue: list[tuple[Path, int, int]] = [(entry.resolve(), 0, 0)]
     visited: set[Path] = set()
     while queue:
-        current, depth = queue.pop(0)
+        current, depth, ext_depth = queue.pop(0)
         if current in visited:
             continue
         visited.add(current)
@@ -571,7 +590,17 @@ def build_dependency_graph(
                 defining_file not in visited
                 and (max_depth is None or depth < max_depth)
             ):
-                queue.append((defining_file, depth + 1))
+                if ext_dirs and _is_external_file(defining_file, ext_dirs):
+                    curr_is_ext = _is_external_file(current, ext_dirs)
+                    new_ext_depth = ext_depth + 1 if curr_is_ext else 1
+                    if (
+                        external_max_depth is not None
+                        and new_ext_depth > external_max_depth
+                    ):
+                        continue
+                else:
+                    new_ext_depth = 0
+                queue.append((defining_file, depth + 1, new_ext_depth))
     if verbose:
         print(file=sys.stderr)
     return graph
@@ -823,6 +852,7 @@ examples:
   python dart_class_resolver.py lib/main.dart --output class-tree
   python dart_class_resolver.py lib/main.dart --output flat --verbose
   python dart_class_resolver.py lib/main.dart --level 2
+  python dart_class_resolver.py lib/main.dart --external-level 1
   python dart_class_resolver.py lib/main.dart --entry-types MyWidget,AppState
         """,
     )
@@ -839,6 +869,14 @@ examples:
                             "1 = only types directly used by the entry file; "
                             "2 = + types used by those types; etc. "
                             "Omit / 0 for unlimited."
+                        ))
+    parser.add_argument("--external-level", metavar="N", type=int, default=0,
+                        help=(
+                            "Maximum traversal depth within external packages. "
+                            "0 = skip external packages entirely; "
+                            "1 = only external files directly referenced by internal code; "
+                            "2 = + files referenced by those external files; etc. "
+                            "Omit for unlimited."
                         ))
     parser.add_argument("--entry-types", metavar="TYPES", default=None,
                         help=(
@@ -858,6 +896,12 @@ def main() -> None:
         if args.level < 0:
             parser.error("--level must be a non-negative integer.")
         max_depth = args.level if args.level > 0 else None
+    # ── --external-level ─────────────────────────────────────────────────────
+    external_max_depth: int | None = None
+    if args.external_level is not None:
+        if args.external_level < 0:
+            parser.error("--external-level must be a non-negative integer.")
+        external_max_depth = args.external_level  # 0 = skip, N = limit, None = unlimited
     # ── target ───────────────────────────────────────────────────────────────
     target = Path(args.target).resolve()
     if not target.exists():
@@ -909,6 +953,7 @@ def main() -> None:
         print(f"[info] pub cache   : {pub_cache or 'not found'}", file=sys.stderr)
         print(f"[info] ext packages: {len(external_lib_dirs)} located", file=sys.stderr)
         print(f"[info] depth limit : {max_depth or 'unlimited'}", file=sys.stderr)
+        print(f"[info] ext depth   : {external_max_depth if external_max_depth is not None else 'unlimited'}", file=sys.stderr)
         print(f"[info] entry types : {entry_types or 'all'}", file=sys.stderr)
         print(file=sys.stderr)
     # ── Run ──────────────────────────────────────────────────────────────────
@@ -920,6 +965,7 @@ def main() -> None:
         max_depth=max_depth,
         entry_types=entry_types,
         external_lib_dirs=external_lib_dirs or None,
+        external_max_depth=external_max_depth,
     )
     # ── Output ───────────────────────────────────────────────────────────────
     if args.output == "flat":
