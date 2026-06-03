@@ -33,6 +33,7 @@ Usage
 """
 from __future__ import annotations
 import argparse
+import os
 import re
 import sys
 from collections import defaultdict
@@ -69,6 +70,112 @@ def find_pubspec(start: Path) -> Path:
                 f"Could not find pubspec.yaml walking up from '{start}'."
             )
         current = parent
+# ---------------------------------------------------------------------------
+# External package resolver (pub cache)
+# ---------------------------------------------------------------------------
+@dataclass
+class ExternalPackage:
+    name: str
+    source: str          # 'hosted' | 'git' | 'path'
+    version: str
+    host: str = "pub.dev"       # hosted only
+    resolved_ref: str = ""      # git only
+    repo_name: str = ""         # git only
+    rel_path: str = "."         # path only
+def read_pubspec_lock(lock_path: Path) -> dict[str, ExternalPackage]:
+    """Parse pubspec.lock and return a map of package_name → ExternalPackage."""
+    try:
+        text = lock_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    raw: dict[str, dict] = {}
+    current_name: str | None = None
+    in_description = False
+    for line in text.splitlines():
+        stripped_line = line.lstrip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+        indent = len(line) - len(stripped_line)
+        if indent == 2 and stripped_line.rstrip().endswith(":"):
+            current_name = stripped_line.rstrip()[:-1]
+            raw[current_name] = {"description": {}}
+            in_description = False
+        elif indent == 4 and current_name:
+            if stripped_line.rstrip() == "description:":
+                in_description = True
+            else:
+                in_description = False
+                key, _, val = stripped_line.partition(":")
+                raw[current_name][key.strip()] = val.strip().strip('"').strip("'")
+        elif indent == 6 and current_name and in_description:
+            key, _, val = stripped_line.partition(":")
+            raw[current_name]["description"][key.strip()] = (
+                val.strip().strip('"').strip("'")
+            )
+    result: dict[str, ExternalPackage] = {}
+    for name, data in raw.items():
+        source = data.get("source", "")
+        version = data.get("version", "")
+        desc = data.get("description", {})
+        if source == "hosted":
+            url = desc.get("url", "https://pub.dev")
+            host = re.sub(r"^https?://", "", url).rstrip("/")
+            result[name] = ExternalPackage(
+                name=name, source="hosted", version=version, host=host,
+            )
+        elif source == "git":
+            resolved_ref = desc.get("resolved-ref", "")
+            url = desc.get("url", "")
+            repo_name = url.rstrip("/").split("/")[-1].removesuffix(".git")
+            result[name] = ExternalPackage(
+                name=name, source="git", version=version,
+                resolved_ref=resolved_ref, repo_name=repo_name,
+            )
+        elif source == "path":
+            result[name] = ExternalPackage(
+                name=name, source="path", version=version,
+                rel_path=desc.get("path", "."),
+            )
+    return result
+def find_pub_cache() -> Path | None:
+    """Return the pub cache directory, checking $PUB_CACHE then common defaults."""
+    cache_env = os.environ.get("PUB_CACHE")
+    if cache_env:
+        p = Path(cache_env)
+        if p.exists():
+            return p
+    home = Path.home()
+    for candidate in [home / ".pub-cache", home / ".cache" / "pub"]:
+        if candidate.exists():
+            return candidate
+    return None
+def _locate_package_lib(
+    pkg: ExternalPackage,
+    pub_cache: Path,
+    project_root: Path,
+) -> Path | None:
+    if pkg.source == "hosted":
+        pkg_dir = pub_cache / "hosted" / pkg.host / f"{pkg.name}-{pkg.version}"
+    elif pkg.source == "git":
+        pkg_dir = pub_cache / "git" / f"{pkg.repo_name}-{pkg.resolved_ref}"
+    elif pkg.source == "path":
+        pkg_dir = (project_root / pkg.rel_path).resolve()
+    else:
+        return None
+    lib = pkg_dir / "lib"
+    return lib if lib.exists() else None
+def locate_external_lib_dirs(
+    packages: dict[str, ExternalPackage],
+    pub_cache: Path,
+    project_root: Path,
+) -> dict[str, Path]:
+    """Return pkg_name → lib_dir for every locatable external package."""
+    result: dict[str, Path] = {}
+    for name, pkg in packages.items():
+        lib = _locate_package_lib(pkg, pub_cache, project_root)
+        if lib is not None:
+            result[name] = lib
+    return result
 # ---------------------------------------------------------------------------
 # Raw import / export extraction
 # ---------------------------------------------------------------------------
@@ -267,15 +374,26 @@ def resolve_uri(
     current_file: Path,
     lib_dir: Path,
     package_name: str,
+    external_lib_dirs: dict[str, Path] | None = None,
 ) -> Path | None:
     if uri.startswith("dart:") or uri.startswith("flutter:"):
         return None
     prefix = f"package:{package_name}/"
     if uri.startswith("package:"):
-        if not uri.startswith(prefix):
-            return None        # foreign package
-        rel = uri[len(prefix):]
-        return (lib_dir / rel).resolve()
+        if uri.startswith(prefix):
+            rel = uri[len(prefix):]
+            return (lib_dir / rel).resolve()
+        # Foreign package – try pub cache
+        if external_lib_dirs:
+            rest = uri[len("package:"):]
+            slash = rest.find("/")
+            if slash != -1:
+                pkg = rest[:slash]
+                rel = rest[slash + 1:]
+                ext_lib = external_lib_dirs.get(pkg)
+                if ext_lib is not None:
+                    return (ext_lib / rel).resolve()
+        return None
     # Relative
     return (current_file.parent / uri).resolve()
 # ---------------------------------------------------------------------------
@@ -304,6 +422,7 @@ def build_type_index(
     lib_dir: Path,
     package_name: str,
     verbose: bool = False,
+    external_lib_dirs: dict[str, Path] | None = None,
 ) -> TypeIndex:
     """
     Scan all files reachable via imports/exports from *entry* and build a
@@ -333,7 +452,8 @@ def build_type_index(
         # Enqueue imported/exported files
         for directive in extract_directives(current):
             resolved = resolve_uri(
-                directive.uri, current, lib_dir, package_name
+                directive.uri, current, lib_dir, package_name,
+                external_lib_dirs=external_lib_dirs,
             )
             if resolved and resolved not in index.visited_for_index:
                 queue.append(resolved)
@@ -375,6 +495,7 @@ def build_dependency_graph(
     verbose: bool = False,
     max_depth: int | None = None,
     entry_types: list[str] | None = None,
+    external_lib_dirs: dict[str, Path] | None = None,
 ) -> DependencyGraph:
     """
     Build a class-level dependency graph starting from *entry*.
@@ -387,7 +508,10 @@ def build_dependency_graph(
     # Step 1 – build the global type index (scan all reachable files once)
     if verbose:
         print("[phase 1] Building type index …", file=sys.stderr)
-    type_index = build_type_index(entry, lib_dir, package_name, verbose=verbose)
+    type_index = build_type_index(
+        entry, lib_dir, package_name, verbose=verbose,
+        external_lib_dirs=external_lib_dirs,
+    )
     if verbose:
         print(
             f"\n[phase 1] done – {len(type_index.type_to_file)} types indexed "
@@ -763,6 +887,17 @@ def main() -> None:
         package_name = read_pubspec_name(pubspec_path)
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
+    # ── External packages (pub cache) ────────────────────────────────────────
+    external_lib_dirs: dict[str, Path] = {}
+    pub_cache: Path | None = None
+    lock_path = project_root / "pubspec.lock"
+    if lock_path.exists():
+        pub_cache = find_pub_cache()
+        if pub_cache is not None:
+            ext_packages = read_pubspec_lock(lock_path)
+            external_lib_dirs = locate_external_lib_dirs(
+                ext_packages, pub_cache, project_root
+            )
     # ── --entry-types ────────────────────────────────────────────────────────
     entry_types: list[str] | None = None
     if args.entry_types:
@@ -771,6 +906,8 @@ def main() -> None:
         print(f"[info] pubspec     : {pubspec_path}", file=sys.stderr)
         print(f"[info] package     : {package_name}", file=sys.stderr)
         print(f"[info] lib dir     : {lib_dir}", file=sys.stderr)
+        print(f"[info] pub cache   : {pub_cache or 'not found'}", file=sys.stderr)
+        print(f"[info] ext packages: {len(external_lib_dirs)} located", file=sys.stderr)
         print(f"[info] depth limit : {max_depth or 'unlimited'}", file=sys.stderr)
         print(f"[info] entry types : {entry_types or 'all'}", file=sys.stderr)
         print(file=sys.stderr)
@@ -782,6 +919,7 @@ def main() -> None:
         verbose=args.verbose,
         max_depth=max_depth,
         entry_types=entry_types,
+        external_lib_dirs=external_lib_dirs or None,
     )
     # ── Output ───────────────────────────────────────────────────────────────
     if args.output == "flat":
